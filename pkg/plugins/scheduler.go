@@ -2,12 +2,15 @@ package plugins
 
 import (
 	"context"
-	"log"
+	"encoding/json"
 	"fmt"
+	"log"
+	"strconv"
+
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"encoding/json"
 )
 
 type CustomSchedulerArgs struct {
@@ -15,7 +18,7 @@ type CustomSchedulerArgs struct {
 }
 
 type CustomScheduler struct {
-	handle 	framework.Handle
+	handle    framework.Handle
 	scoreMode string
 }
 
@@ -24,11 +27,11 @@ var _ framework.ScorePlugin = &CustomScheduler{}
 
 // Name is the name of the plugin used in Registry and configurations.
 const (
-	Name				string = "CustomScheduler"
-	groupNameLabel 		string = "podGroup"
-	minAvailableLabel 	string = "minAvailable"
-	leastMode			string = "Least"
-	mostMode			string = "Most"			
+	Name              string = "CustomScheduler"
+	groupNameLabel    string = "podGroup"
+	minAvailableLabel string = "minAvailable"
+	leastMode         string = "Least"
+	mostMode          string = "Most"
 )
 
 func (cs *CustomScheduler) Name() string {
@@ -66,7 +69,25 @@ func (cs *CustomScheduler) PreFilter(ctx context.Context, state *framework.Cycle
 	// 1. extract the label of the pod
 	// 2. retrieve the pod with the same group label
 	// 3. justify if the pod can be scheduled
+	podLabel := pod.ObjectMeta.Labels["podGroup"]
+	selector := labels.SelectorFromSet(labels.Set{"podGroup": podLabel})
+	// Get the slice of pods that matches the selector
+	pods, err := cs.handle.SharedInformerFactory().Core().V1().Pods().Lister().List(selector)
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, fmt.Sprintf("Error listing pods: %v", err))
+	}
 
+	// Justify if the pod can be scheduled
+	minAvailableStr := pod.ObjectMeta.Labels["minAvailable"]
+
+	// Convert the string to an integer
+	minAvailable, _ := strconv.Atoi(minAvailableStr)
+
+	if len(pods) < minAvailable {
+		return nil, framework.NewStatus(framework.Unschedulable, "Not enough pods available in the group")
+	}
+
+	// Pod can be scheduled
 	return nil, newStatus
 }
 
@@ -75,7 +96,6 @@ func (cs *CustomScheduler) PreFilterExtensions() framework.PreFilterExtensions {
 	return nil
 }
 
-
 // Score invoked at the score extension point.
 func (cs *CustomScheduler) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	log.Printf("Pod %s is in Score phase. Calculate the score of Node %s.", pod.Name, nodeName)
@@ -83,16 +103,48 @@ func (cs *CustomScheduler) Score(ctx context.Context, state *framework.CycleStat
 	// TODO
 	// 1. retrieve the node allocatable memory
 	// 2. return the score based on the scheduler mode
-	
-	return 0, nil
+	nodeInfo, err := cs.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		return 0, framework.NewStatus(framework.Error, fmt.Sprintf("Error getting node info: %v", err))
+	}
+
+	// Get the node allocatable memory
+	allocatableMemory := nodeInfo.Allocatable.Memory
+
+	// Score based on the scheduler mode
+	var score int64
+	switch cs.scoreMode {
+	case mostMode:
+		score = allocatableMemory
+	case leastMode:
+		score = (1024 * 1024 * 1024) - allocatableMemory
+	}
+
+	return score, framework.NewStatus(framework.Success, "")
 }
 
 // ensure the scores are within the valid range
 func (cs *CustomScheduler) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
 	// TODO
 	// find the range of the current score and map to the valid range
+	minScore := scores[0].Score
+	maxScore := scores[0].Score
 
-	return nil
+	for _, nodeScore := range scores {
+		if nodeScore.Score < minScore {
+			minScore = nodeScore.Score
+		}
+		if nodeScore.Score > maxScore {
+			maxScore = nodeScore.Score
+		}
+	}
+
+	// Normalize scores to the target range
+	for i := range scores {
+		scores[i].Score = ((scores[i].Score - minScore) * (framework.MaxNodeScore - framework.MinNodeScore) / (maxScore - minScore)) + framework.MinNodeScore
+	}
+
+	return framework.NewStatus(framework.Success, "Scores normalized successfully")
 }
 
 // ScoreExtensions of the Score plugin.
